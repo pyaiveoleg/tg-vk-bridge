@@ -1,0 +1,6 @@
+telethon>=1.36,<2
+aiohttp>=3.9
+python-dotenv>=1.0
+# optional, ускоряет шифрование Telethon (можно убрать, если не ставится):
+cryptg>=0.4
+yt-dlp>=2025.1
