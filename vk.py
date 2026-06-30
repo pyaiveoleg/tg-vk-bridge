@@ -4,6 +4,7 @@
 вложений (фото / документы / голосовые) в личные сообщения.
 """
 import asyncio
+import json
 import os
 import random
 
@@ -48,12 +49,26 @@ class VK:
             )
         raise VKError(f"{method}: retry limit exceeded")
 
-    async def send(self, peer_id: int, text: str = None, attachment: str = None):
+    async def send(
+        self,
+        peer_id: int,
+        text: str = None,
+        attachment: str = None,
+        reply_to_cmid: int = None,
+    ):
+        forward = None
+        if reply_to_cmid is not None:
+            forward = json.dumps({
+                "peer_id": peer_id,
+                "conversation_message_ids": [reply_to_cmid],
+                "is_reply": 1,
+            })
         return await self.api(
             "messages.send",
             peer_id=peer_id,
             message=text,
             attachment=attachment,
+            forward=forward,
             random_id=random.randint(1, 2 ** 31 - 1),
         )
 

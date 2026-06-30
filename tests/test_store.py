@@ -69,6 +69,18 @@ class StoreTests(unittest.TestCase):
         recent = self.store.recent_tg_links()
         self.assertEqual([item[1] for item in recent], [102, 101])
 
+    def test_reaction_fallback_is_persisted_and_unlinked(self):
+        self.store.link_messages(10, 101, 20, 7, direction="tg_to_vk")
+        self.store.set_tg_reaction_fallback(10, 101, 20, 8)
+
+        self.assertEqual(
+            Store(self.path).get_tg_reaction_fallback(10, 101),
+            [20, 8],
+        )
+
+        self.store.unlink_vk(20, 7)
+        self.assertIsNone(self.store.get_tg_reaction_fallback(10, 101))
+
 
 if __name__ == "__main__":
     unittest.main()

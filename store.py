@@ -18,7 +18,8 @@ class Store:
         self.data = {
             "token_to_peer": {}, "peer_to_token": {}, "last_peer": None, "peer_meta": {},
             "msg_t2v": {}, "msg_v2t": {},
-            "msg_dirs": {}, "tg_reactions": {}, "sync_state": {},
+            "msg_dirs": {}, "tg_reactions": {}, "tg_reaction_fallbacks": {},
+            "sync_state": {},
         }
         self._load()
 
@@ -169,6 +170,21 @@ class Store:
     def get_tg_reaction(self, tg_chat, tg_msg_id):
         return self.data.get("tg_reactions", {}).get(f"{tg_chat}:{tg_msg_id}")
 
+    def set_tg_reaction_fallback(self, tg_chat, tg_msg_id, vk_peer=None, vk_cmid=None):
+        key = f"{tg_chat}:{tg_msg_id}"
+        with self._lock:
+            fallbacks = self.data.setdefault("tg_reaction_fallbacks", {})
+            if vk_peer is None:
+                fallbacks.pop(key, None)
+            else:
+                fallbacks[key] = [vk_peer, vk_cmid]
+            self._save()
+
+    def get_tg_reaction_fallback(self, tg_chat, tg_msg_id):
+        return self.data.get("tg_reaction_fallbacks", {}).get(
+            f"{tg_chat}:{tg_msg_id}"
+        )
+
     def get_sync_state(self, key, default=None):
         return self.data.get("sync_state", {}).get(key, default)
 
@@ -210,6 +226,7 @@ class Store:
                 self.data.setdefault("msg_t2v", {}).pop(tg_key, None)
                 self.data.setdefault("msg_dirs", {}).pop(tg_key, None)
                 self.data.setdefault("tg_reactions", {}).pop(tg_key, None)
+                self.data.setdefault("tg_reaction_fallbacks", {}).pop(tg_key, None)
             self._save()
 
     def set_last_peer(self, peer):

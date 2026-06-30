@@ -1,0 +1,13 @@
+// дать возможность себе ходить по ssh
+vi .ssh/authorized_keys
+    // вставить туда публичный ключ
+mkdir tg-vk-bridge
+
+// залить на виртуалку
+scp .env bridge.py config.py docker-compose.yml Dockerfile reactions.py requirements.txt store.py vk.py root@78.17.114.254:/root/tg-vk-bridge/
+
+// поставить докер
+https://timeweb.cloud/tutorials/docker/kak-ustanovit-docker-na-ubuntu-22-04
+
+// собрать
+docker compose up -d --build

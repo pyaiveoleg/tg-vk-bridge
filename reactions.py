@@ -39,21 +39,24 @@ VK_TO_EMOJI = {
     64: "⚡",  # done
 }
 
+def _normalize(emoji: str) -> str:
+    """Убрать variation selector (U+FE0F), которым отличаются ❤️ и ❤."""
+    return (emoji or "").replace("️", "")
+
+
 # обратное соответствие эмодзи -> reaction_id VK
-EMOJI_TO_VK = {v: k for k, v in VK_TO_EMOJI.items()}
-# Некоторые реакции пользователь VK может поставить на сообщение сообщества,
-# но messages.sendReaction с токеном сообщества отвергает тот же id (code 1009).
-# Для TG -> VK используем ближайший доступный аналог, не меняя обратную карту.
+EMOJI_TO_VK = {_normalize(v): k for k, v in VK_TO_EMOJI.items()}
+# Алиасы для эмодзи, которых нет в основной карте, но которые встречаются как
+# реакции Telegram. ВАЖНО: маппим только на id, которые ЕСТЬ в VK_TO_EMOJI —
+# иначе VK поставит неожиданную реакцию или вернёт ошибку 1009.
 EMOJI_TO_VK.update({
-    "💅": 15,  # точный id=36 недоступен для отправки сообществом -> 😍
-})
-# распространённые варианты/алиасы эмодзи, приводим к тем же id
-EMOJI_TO_VK.update({
-    "❤️": 1,
-    "😂": 4,
-    "😮": 5,
-    "😭": 6,
-    "🤬": 7,
+    _normalize(k): v for k, v in {
+        "💅": 15,  # точный id=36 недоступен для отправки сообществом -> 😍
+        "🤣": 11,  # ещё один «смех» -> 😁
+        "🥰": 1,   # -> ❤
+        "🙂": 11,  # -> 😁
+        "🥳": 2,   # -> 🔥
+    }.items()
 })
 
 # на что заменять, если точного соответствия нет
@@ -62,7 +65,7 @@ DEFAULT_TG_EMOJI = "👍"
 
 
 def emoji_to_vk(emoji: str) -> int:
-    return EMOJI_TO_VK.get(emoji, DEFAULT_VK_REACTION)
+    return EMOJI_TO_VK.get(_normalize(emoji), DEFAULT_VK_REACTION)
 
 
 def vk_to_emoji(reaction_id: int):

@@ -24,12 +24,14 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     InputPeerUser, InputPeerChannel, InputPeerChat,
-    UpdateMessageReactions, ReactionEmoji,
+    UpdateMessageReactions, ReactionEmoji, ReactionCustomEmoji,
+    DocumentAttributeCustomEmoji,
     SendMessageTypingAction, SendMessageRecordAudioAction,
     SendMessageRecordRoundAction, SendMessageCancelAction,
 )
 from telethon.tl.functions.messages import (
     SendReactionRequest, SetTypingRequest, GetUnreadReactionsRequest,
+    GetCustomEmojiDocumentsRequest,
 )
 
 import config
@@ -58,6 +60,26 @@ if not config.TG_SESSION:
 tg = TelegramClient(StringSession(config.TG_SESSION), config.TG_API_ID, config.TG_API_HASH)
 
 TOKEN_RE = re.compile(r"#([0-9a-f]{4,})")
+
+# Потолок для скачивания VK-вложений: всё читается потоком на диск, но крупные
+# файлы лучше отдать ссылкой, чем съесть память/упереться в лимит Telegram.
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 ГБ (лимит загрузки в Telegram)
+VIDEO_MAX_BYTES = config.VK_VIDEO_MAX_MB * 1024 * 1024
+
+# Кэш «document_id премиум-эмодзи -> базовый юникод-эмодзи» (alt).
+_custom_emoji_alt: dict = {}
+
+
+def _vk_message_actor(m: dict):
+    return m.get("from_id") or m.get("user_id")
+
+
+def _vk_message_peer(m: dict):
+    return m.get("peer_id", config.VK_OWNER_ID)
+
+
+def _vk_message_cmid(m: dict):
+    return m.get("conversation_message_id") or m.get("cmid")
 
 
 # =========================== TG -> VK ===========================
@@ -111,23 +133,35 @@ async def _forward_tg_messages(event, messages):
     texts = []
     attachments = []
     tmp_dirs = []
+    failed = 0
     try:
         for msg in messages:
             text = msg.message or ""
             if text and text not in texts:
                 texts.append(text)
-            if msg.media:
-                # У видеокружков обычно одинаковое имя video.mp4. Отдельная
-                # директория на сообщение исключает гонку двух быстрых загрузок.
+            if not msg.media:
+                continue
+            # Сбой одного вложения не должен терять остальной альбом и текст.
+            # У видеокружков обычно одинаковое имя video.mp4. Отдельная
+            # директория на сообщение исключает гонку двух быстрых загрузок.
+            try:
                 tmp_dir = tempfile.mkdtemp(prefix=f"tg-{peer}-{msg.id}-")
                 tmp_dirs.append(tmp_dir)
                 tmp_path = await msg.download_media(file=tmp_dir)
-                if tmp_path:
-                    attachment = await _upload_tg_media_to_vk(msg, tmp_path)
-                    if attachment:
-                        attachments.append(attachment)
+                attachment = (
+                    await _upload_tg_media_to_vk(msg, tmp_path) if tmp_path else None
+                )
+            except Exception as e:
+                log.warning("TG media (chat=%s msg=%s) не переслано: %s", peer, msg.id, e)
+                attachment = None
+            if attachment:
+                attachments.append(attachment)
+            else:
+                failed += 1
 
         body = header + (("\n" + "\n".join(texts)) if texts else "")
+        if failed:
+            body += f"\n⚠️ вложений не переслано: {failed}"
         mid = await vk.send(
             config.VK_OWNER_ID,
             text=body,
@@ -224,7 +258,9 @@ async def _upload_tg_media_to_vk(msg, path: str):
             return await vk.upload_doc(peer, path, doc_type="audio_message")
         # видео, кружки, гифки, документы, аудио, стикеры -> документ
         return await vk.upload_doc(peer, path, doc_type="doc")
-    except VKError as e:
+    except Exception as e:
+        # не только VKError: сервер загрузки может вернуть битый JSON (KeyError)
+        # или оборвать соединение — это не должно ронять пересылку всего альбома.
         log.warning("VK upload failed: %s", e)
         return None
 
@@ -238,22 +274,58 @@ async def on_tg_reaction(update):
         log.warning("TG->VK reaction failed: %s", e)
 
 
-def _other_user_reaction(message_reactions):
-    """Получить реакцию собеседника, исключив реакцию нашего userbot."""
+def _extract_other_reaction(message_reactions):
+    """Реакция собеседника (исключая нашу). Возвращает (kind, value):
+
+    ('emoji', emoticon)        — стандартная реакция Telegram;
+    ('custom', document_id)    — премиум-эмодзи (VK такие реакции не умеет);
+    None                       — реакции нет.
+    """
+    def classify(reaction):
+        if isinstance(reaction, ReactionEmoji):
+            return ("emoji", reaction.emoticon)
+        if isinstance(reaction, ReactionCustomEmoji):
+            return ("custom", reaction.document_id)
+        return None
+
     recent = getattr(message_reactions, "recent_reactions", None) or []
     for item in reversed(recent):
         if utils.get_peer_id(item.peer_id) == me_id:
             continue
-        if isinstance(item.reaction, ReactionEmoji):
-            return item.reaction.emoticon
+        found = classify(item.reaction)
+        if found:
+            return found
 
     # Telegram иногда не присылает recent_reactions, пока сообщение не открыто.
     # В личном чате из агрегированных счётчиков можно вычесть нашу реакцию.
     for item in getattr(message_reactions, "results", None) or []:
         mine = 1 if getattr(item, "chosen_order", None) is not None else 0
-        if getattr(item, "count", 0) > mine and isinstance(item.reaction, ReactionEmoji):
-            return item.reaction.emoticon
+        if getattr(item, "count", 0) > mine:
+            found = classify(item.reaction)
+            if found:
+                return found
     return None
+
+
+async def _resolve_custom_emoji(document_id) -> str:
+    """Свести премиум-эмодзи к его базовому юникод-эмодзи (alt)."""
+    if document_id in _custom_emoji_alt:
+        return _custom_emoji_alt[document_id]
+    alt = None
+    try:
+        docs = await tg(GetCustomEmojiDocumentsRequest(document_id=[document_id]))
+        for doc in docs or []:
+            for attr in getattr(doc, "attributes", None) or []:
+                if isinstance(attr, DocumentAttributeCustomEmoji) and attr.alt:
+                    alt = attr.alt
+                    break
+            if alt:
+                break
+    except Exception as e:
+        log.debug("Не удалось раскрыть премиум-эмодзи %s: %s", document_id, e)
+    alt = alt or "❤"  # видимый запасной вариант, чтобы реакцию не потерять
+    _custom_emoji_alt[document_id] = alt
+    return alt
 
 
 async def _process_tg_reaction_update(update):
@@ -265,19 +337,75 @@ async def _sync_tg_reaction(chat_id, msg_id, message_reactions):
     link = store.vk_for_tg(chat_id, msg_id)
     if not link:
         return
+    info = _extract_other_reaction(message_reactions) if message_reactions else None
+    emoji = None
+    force_message = False
+    if info:
+        kind, value = info
+        if kind == "emoji":
+            emoji = value
+        else:  # премиум-эмодзи: VK не умеет такие реакции — шлём сообщением-ответом
+            emoji = await _resolve_custom_emoji(value)
+            force_message = True
+    await _sync_tg_reaction_emoji(chat_id, msg_id, emoji, force_message=force_message)
+
+
+async def _sync_tg_reaction_emoji(chat_id, msg_id, emoji, force_message=False):
+    link = store.vk_for_tg(chat_id, msg_id)
+    if not link:
+        return
     vk_peer, vk_cmid = link
-    emoji = _other_user_reaction(message_reactions) if message_reactions else None
     previous = store.get_tg_reaction(chat_id, msg_id)
     if emoji == previous:
         return
     if emoji is None:
         if previous is not None:
-            await vk.delete_reaction(vk_peer, vk_cmid)
+            if not await _delete_tg_reaction_fallback(chat_id, msg_id):
+                await vk.delete_reaction(vk_peer, vk_cmid)
             store.set_tg_reaction(chat_id, msg_id, None)
         return
-    await vk.send_reaction(vk_peer, vk_cmid, reactions.emoji_to_vk(emoji))
+
+    await _delete_tg_reaction_fallback(chat_id, msg_id)
+    # force_message=True для премиум-эмодзи: VK-реакции такое не отобразят,
+    # поэтому сразу отправляем эмодзи отдельным сообщением-ответом.
+    sent_via_reaction = False
+    if not force_message:
+        try:
+            await vk.send_reaction(vk_peer, vk_cmid, reactions.emoji_to_vk(emoji))
+            store.set_tg_reaction_fallback(chat_id, msg_id, None)
+            sent_via_reaction = True
+        except VKError:
+            sent_via_reaction = False
+
+    if not sent_via_reaction:
+        if previous is not None:
+            try:
+                await vk.delete_reaction(vk_peer, vk_cmid)
+            except VKError:
+                pass
+        mid = await vk.send(vk_peer, text=emoji, reply_to_cmid=vk_cmid)
+        try:
+            fallback_cmid = await vk.get_message_cmid(mid)
+        except Exception:
+            fallback_cmid = None
+        store.set_tg_reaction_fallback(chat_id, msg_id, vk_peer, fallback_cmid)
     store.set_tg_reaction(chat_id, msg_id, emoji)
-    log.info("TG reaction: chat=%s msg=%s emoji=%s", chat_id, msg_id, emoji)
+    if sent_via_reaction:
+        log.info("TG reaction: chat=%s msg=%s emoji=%s", chat_id, msg_id, emoji)
+
+
+async def _delete_tg_reaction_fallback(chat_id, msg_id):
+    fallback = store.get_tg_reaction_fallback(chat_id, msg_id)
+    if not fallback:
+        return False
+    vk_peer, fallback_cmid = fallback
+    if fallback_cmid:
+        try:
+            await vk.delete(vk_peer, fallback_cmid)
+        except VKError:
+            pass
+    store.set_tg_reaction_fallback(chat_id, msg_id, None)
+    return True
 
 
 async def reaction_poll_loop():
@@ -402,7 +530,7 @@ async def vk_loop():
 
 async def _handle_vk_message(m: dict):
     # принимаем только от владельца (тебя), игнорим прочих писавших в сообщество
-    if m.get("from_id") != config.VK_OWNER_ID:
+    if _vk_message_actor(m) != config.VK_OWNER_ID:
         return
 
     target = None
@@ -419,7 +547,7 @@ async def _handle_vk_message(m: dict):
         return
 
     log.info("VK->TG [DIAG]: cmid=%s reply=%s -> target=%s (last_peer=%s) text=%r",
-             m.get("conversation_message_id"), bool(reply), target,
+             _vk_message_cmid(m), bool(reply), target,
              store.get_last_peer(), (m.get("text") or "")[:40])
 
     text = m.get("text") or ""
@@ -430,7 +558,7 @@ async def _handle_vk_message(m: dict):
     if extra:
         text = (text + "\n" + "\n".join(extra)).strip()
 
-    cmid = m.get("conversation_message_id")
+    cmid = _vk_message_cmid(m)
     sent_messages = []
     try:
         if files:
@@ -457,9 +585,13 @@ async def _handle_vk_message(m: dict):
 async def _handle_vk_edit(obj: dict):
     # объект события message_edit — это само сообщение (без вложенного "message")
     m = obj.get("message", obj)
-    if m.get("from_id") != config.VK_OWNER_ID:
+    if _vk_message_actor(m) != config.VK_OWNER_ID:
         return  # правки самого сообщества (наши же) игнорируем -> нет петли
-    link = store.tg_for_vk(m.get("peer_id"), m.get("conversation_message_id"))
+    peer_id = _vk_message_peer(m)
+    cmid = _vk_message_cmid(m)
+    if not cmid:
+        return
+    link = store.tg_for_vk(peer_id, cmid)
     if not link:
         return
     chat, msg_id = link
@@ -475,7 +607,10 @@ async def _handle_vk_reaction(obj: dict):
     # только реакции владельца; реакции самого сообщества (наши же) сюда не попадут -> нет петли
     if obj.get("reacted_id") != config.VK_OWNER_ID:
         return
-    link = store.tg_for_vk(obj.get("peer_id"), obj.get("cmid"))
+    link = store.tg_for_vk(
+        obj.get("peer_id", config.VK_OWNER_ID),
+        obj.get("cmid") or obj.get("conversation_message_id"),
+    )
     if not link:
         return
     chat, msg_id = link
@@ -496,8 +631,8 @@ async def _handle_vk_reaction(obj: dict):
 
 async def _handle_vk_delete(obj: dict):
     m = obj.get("message", obj)
-    peer_id = m.get("peer_id", config.VK_OWNER_ID)
-    cmid = m.get("conversation_message_id") or m.get("cmid")
+    peer_id = _vk_message_peer(m)
+    cmid = _vk_message_cmid(m)
     if peer_id != config.VK_OWNER_ID or not cmid:
         return
     links = store.tg_all_for_vk(peer_id, cmid)
@@ -520,8 +655,8 @@ async def _handle_vk_read(obj: dict):
     if not config.SYNC_READS:
         return
     data = obj.get("message", obj)
-    actor = data.get("from_id") or data.get("user_id")
-    peer_id = data.get("peer_id", config.VK_OWNER_ID)
+    actor = _vk_message_actor(data)
+    peer_id = _vk_message_peer(data)
     if actor not in (None, config.VK_OWNER_ID) or peer_id != config.VK_OWNER_ID:
         return
     cmid = (
@@ -569,7 +704,7 @@ async def _handle_vk_typing(obj: dict):
     if not config.SYNC_TYPING:
         return
     data = obj.get("message", obj)
-    actor = data.get("from_id") or data.get("user_id")
+    actor = _vk_message_actor(data)
     if actor != config.VK_OWNER_ID:
         return
     target = store.get_last_peer()
@@ -733,26 +868,24 @@ async def _collect_vk_attachments(atts, files, extra, depth=0):
             )
             kind, suffix = "round", ".mp4"
         elif t == "video":
-            url = _best_vk_video_url(obj)
-            if not url and obj.get("owner_id") is not None and obj.get("id") is not None:
-                try:
-                    full = await vk.get_video(
-                        obj["owner_id"], obj["id"], obj.get("access_key")
-                    )
-                    if full:
-                        url = _best_vk_video_url(full)
-                        obj = {**obj, **full}
-                except Exception as e:
-                    log.debug("Не удалось раскрыть VK video: %s", e)
-            if url:
+            owner_id, video_id = obj.get("owner_id"), obj.get("id")
+            # Прямой mp4 (если VK его уже отдал в long poll) — скачиваем сразу,
+            # иначе уходим в _append_vk_video с фолбэком на video.get + yt-dlp.
+            direct = _best_vk_video_url(obj)
+            if direct:
                 kind, suffix = (
                     ("round", ".mp4") if obj.get("is_round") else ("video", ".mp4")
                 )
-            else:
-                extra.append(
-                    f"📹 https://vk.com/video{obj.get('owner_id')}_{obj.get('id')}"
-                )
+                try:
+                    files.append((await _download_url(direct, suffix, VIDEO_MAX_BYTES), kind))
+                    continue
+                except Exception as e:
+                    log.debug("Прямой VK mp4 не скачался, пробую video.get/yt-dlp: %s", e)
+            if owner_id is not None and video_id is not None and await _append_vk_video(
+                    owner_id, video_id, obj.get("access_key"), files, extra):
                 continue
+            extra.append(f"📹 https://vk.com/video{owner_id}_{video_id}")
+            continue
         elif t == "link":
             link_url = obj.get("url", "")
             match = _wall_link_match(link_url)
@@ -797,11 +930,12 @@ async def _collect_vk_attachments(atts, files, extra, depth=0):
             continue
 
         if url:
+            cap = VIDEO_MAX_BYTES if kind in ("video", "round") else MAX_DOWNLOAD_BYTES
             try:
-                files.append((await _download_url(url, suffix), kind))
+                files.append((await _download_url(url, suffix, cap), kind))
             except Exception as e:
                 log.warning("Не удалось скачать VK-вложение %s: %s", t, e)
-                if t == "video":
+                if t in ("video", "video_message", "video_note"):
                     extra.append(
                         f"📹 https://vk.com/video{obj.get('owner_id')}_{obj.get('id')}"
                     )
@@ -850,12 +984,17 @@ async def _append_wall_post(owner_id, post_id, files, extra, depth):
 async def _append_vk_video(
         owner_id, video_id, access_key, files, extra, source_url=None):
     """Загрузить VK-видео через API, затем через yt-dlp как fallback."""
+    item = {}
     try:
-        item = await vk.get_video(owner_id, video_id, access_key)
-        item = item or {}
+        item = await vk.get_video(owner_id, video_id, access_key) or {}
+    except Exception as e:
+        # community-токену часто недоступен video.get (нет scope video). Это
+        # не повод сдаваться: ниже пробуем yt-dlp по публичной/embed-ссылке.
+        log.debug("video.get %s_%s не сработал: %s", owner_id, video_id, e)
+    try:
         direct_url = _best_vk_video_url(item)
         if direct_url:
-            path = await _download_url(direct_url, ".mp4")
+            path = await _download_url(direct_url, ".mp4", VIDEO_MAX_BYTES)
             info = item
         else:
             # video.get обычно не отдаёт files, но возвращает player с oid/id/hash.
@@ -985,15 +1124,35 @@ async def _expand_vk_links(text, files, extra):
     return result
 
 
-async def _download_url(url: str, suffix: str = "") -> str:
-    async with http.get(url) as r:
+async def _download_url(url: str, suffix: str = "", max_bytes: int = MAX_DOWNLOAD_BYTES) -> str:
+    """Скачать файл потоком на диск (без чтения целиком в память).
+
+    Если файл крупнее max_bytes — бросаем ошибку, чтобы вызывающий оставил
+    ссылку, а не пытался залить гиганта (и не словил OOM).
+    """
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with http.get(url, timeout=timeout) as r:
         r.raise_for_status()
-        data = await r.read()
-    if not suffix:
-        suffix = os.path.splitext(url.split("?")[0])[1] or ""
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+        declared = r.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            raise ValueError(f"файл слишком большой: {declared} байт > {max_bytes}")
+        if not suffix:
+            suffix = os.path.splitext(url.split("?")[0])[1] or ""
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        size = 0
+        try:
+            with os.fdopen(fd, "wb") as f:
+                async for chunk in r.content.iter_chunked(1 << 16):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(f"файл превысил лимит {max_bytes} байт")
+                    f.write(chunk)
+        except BaseException:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
     return path
 
 
